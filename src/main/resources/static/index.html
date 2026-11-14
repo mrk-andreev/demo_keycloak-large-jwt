@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keycloak oversized JWT / effective permissions demo</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, sans-serif; }
+    body { max-width: 860px; margin: 46px auto; padding: 0 20px; line-height: 1.55; color: #172032; }
+    h1 { font-size: 27px; letter-spacing: -.6px; }
+    h2 { font-size: 18px; margin: 27px 0 8px; }
+    .muted { color: #536074; }
+    .panel { background: #f5f7fa; border: 1px solid #dce2e9; border-radius: 12px; padding: 20px; margin: 18px 0; }
+    button { background: #123f80; color: white; border: 0; border-radius: 7px; padding: 10px 14px;
+      cursor: pointer; margin: 4px 6px 4px 0; font-weight: 600; }
+    button:disabled { opacity: .38; cursor: not-allowed; }
+    button.secondary { background: #59697b; }
+    button.danger { background: #974b36; }
+    pre { background: #0d1726; color: #d8e8fb; padding: 16px; border-radius: 9px;
+      overflow-x: auto; white-space: pre-wrap; word-break: break-word; min-height: 40px; }
+    code { background: #e9eef5; padding: 2px 5px; border-radius: 4px; }
+    .pill { display: inline-block; padding: 4px 9px; background: #e2f1e7; border-radius: 99px; }
+  </style>
+</head>
+<body>
+  <h1>Oversized JWT → effective permissions API</h1>
+  <p class="muted">A runnable example of Keycloak composite-role expansion and a lean-token alternative.
+    Sign in with <code>trader / trader</code>. Uses Authorization Code + PKCE in the browser.</p>
+  <div class="panel">
+    <button onclick="login('lean-cli')">Sign in: lean JWT</button>
+    <button class="secondary" onclick="login('verbose-cli')">Sign in: oversized JWT</button>
+    <button class="secondary" onclick="clearSession()">Clear local session</button>
+    <p id="session" class="muted">No active local session.</p>
+  </div>
+  <div class="panel">
+    <h2>Frontend feature permissions</h2>
+    <p>Buttons use the response from <code>GET /api/me/permissions?prefix=orders:</code>.</p>
+    <button id="read" onclick="apiCall('GET', '/api/orders')" disabled>Read orders</button>
+    <button id="cancel" onclick="apiCall('POST', '/api/orders/cancel')" disabled>Cancel order</button>
+    <button id="create" onclick="apiCall('POST', '/api/orders')" disabled>Create order</button>
+    <button class="secondary" onclick="loadPermissions()">Refresh permissions</button>
+    <h2>API result</h2>
+    <pre id="output">Sign in to start.</pre>
+  </div>
+  <p class="muted">Backend authorization is always enforced. UI button state is advisory.
+    A cache entry lasts 20 seconds. For the revocation exercise, refresh after the TTL.
+    This is a local-development demo; do not reuse its passwords or Direct Access Grants configuration in production.</p>
+<script>
+  const issuer = 'http://localhost:8080/realms/large-jwt-demo';
+  let accessToken = null;
+  let activeClient = null;
+  const out = document.querySelector('#output');
+  const sessionInfo = document.querySelector('#session');
+  const utf8 = new TextEncoder();
+
+  function encodeBase64Url(bytes) {
+    return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+  function randomString() { return encodeBase64Url(crypto.getRandomValues(new Uint8Array(32))); }
+  function sizeText() { return accessToken ? `${utf8.encode(accessToken).length.toLocaleString()} bytes` : 'none'; }
+
+  async function login(client) {
+    const verifier = randomString();
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', utf8.encode(verifier)));
+    const state = randomString();
+    sessionStorage.setItem('pkce', JSON.stringify({verifier, state, client}));
+    const params = new URLSearchParams({
+      client_id: client, redirect_uri: location.origin + '/', response_type: 'code',
+      scope: 'openid', state, code_challenge: encodeBase64Url(digest),
+      code_challenge_method: 'S256'
+    });
+    location.assign(issuer + '/protocol/openid-connect/auth?' + params.toString());
+  }
+
+  async function exchangeCode() {
+    const params = new URLSearchParams(location.search);
+    if (params.has('error')) throw new Error('Keycloak returned: ' + params.get('error'));
+    const code = params.get('code');
+    if (!code) return;
+    const pending = JSON.parse(sessionStorage.getItem('pkce') || 'null');
+    history.replaceState(null, '', '/');
+    sessionStorage.removeItem('pkce');
+    if (!pending || params.get('state') !== pending.state) throw new Error('OIDC state mismatch');
+    const response = await fetch(issuer + '/protocol/openid-connect/token', {
+      method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({
+        grant_type: 'authorization_code', client_id: pending.client, code,
+        redirect_uri: location.origin + '/', code_verifier: pending.verifier
+      })
+    });
+    if (!response.ok) throw new Error('Token exchange failed: HTTP ' + response.status);
+    const tokens = await response.json();
+    accessToken = tokens.access_token;
+    activeClient = pending.client;
+    sessionInfo.textContent = `${activeClient} — access token: ${sizeText()} — expires in ${tokens.expires_in}s`;
+    await loadPermissions();
+  }
+
+  async function apiCall(method, path, jsonBody = undefined) {
+    if (!accessToken) { out.textContent = 'Please sign in.'; return; }
+    try {
+      const response = await fetch(path, {
+        method, headers: {
+          'Authorization': 'Bearer ' + accessToken,
+          ...(jsonBody !== undefined ? {'Content-Type': 'application/json'} : {})
+        }, body: jsonBody !== undefined ? JSON.stringify(jsonBody) : undefined
+      });
+      const body = await response.text();
+      out.textContent = `${method} ${path}\nHTTP ${response.status}\n${body.slice(0, 2500)}`;
+      return {status: response.status, body};
+    } catch (error) { out.textContent = String(error); }
+  }
+
+  async function loadPermissions() {
+    const result = await apiCall('GET', '/api/me/permissions?prefix=orders:');
+    const permissions = result?.status === 200 ? new Set(JSON.parse(result.body).permissions) : new Set();
+    for (const name of ['read', 'cancel', 'create']) {
+      document.querySelector('#' + name).disabled = !permissions.has('orders:' + name);
+    }
+  }
+
+  function clearSession() {
+    accessToken = null; activeClient = null;
+    sessionStorage.removeItem('pkce');
+    sessionInfo.textContent = 'No active local session.';
+    out.textContent = 'Local token cleared. Keycloak SSO session may still be active.';
+    for (const name of ['read', 'cancel', 'create']) document.querySelector('#' + name).disabled = true;
+  }
+
+  exchangeCode().catch(error => { out.textContent = 'Login failed: ' + String(error); });
+</script>
+</body>
+</html>

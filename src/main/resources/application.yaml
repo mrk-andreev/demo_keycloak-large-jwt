@@ -1,0 +1,26 @@
+server:
+  port: 8081
+  # Set an explicit, small limit to make the large-token failure deterministic.
+  max-http-request-header-size: 8KB
+spring:
+  application:
+    name: keycloak-large-jwt-demo
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Matches the issuer embedded in browser-issued Keycloak tokens.
+          issuer-uri: ${KEYCLOAK_EXTERNAL_URL:http://localhost:8080}/realms/large-jwt-demo
+          # DNS name reachable inside the Compose network for JWKS retrieval.
+          jwk-set-uri: ${KEYCLOAK_INTERNAL_URL:http://localhost:8080}/realms/large-jwt-demo/protocol/openid-connect/certs
+          audiences: demo-api
+
+demo:
+  keycloak:
+    admin-base-url: ${KEYCLOAK_INTERNAL_URL:http://localhost:8080}
+    realm: large-jwt-demo
+    catalog-client-id: permission-catalog
+    authz-client-id: authz-svc
+    authz-client-secret: ${AUTHZ_CLIENT_SECRET:demo-authz-secret}
+  cache:
+    ttl-seconds: 20
